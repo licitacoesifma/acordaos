@@ -613,6 +613,12 @@
             line-height: 1.5;
         }
 
+        .load-more-container {
+            display: flex;
+            justify-content: center;
+            margin-top: var(--space-8);
+        }
+
         /* ════════════════════════════════════════
            LOADING STATE
            ════════════════════════════════════════ */
@@ -1087,6 +1093,15 @@
                 <div class="results-meta" id="results-meta"></div>
             </div>
             <div class="results-grid" id="results-grid"></div>
+            
+            <div id="load-more-container" class="load-more-container" style="display: none;">
+                <button id="load-more-btn" class="search-btn">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="6 9 12 15 18 9"></polyline>
+                    </svg>
+                    Carregar mais 25 resultados
+                </button>
+            </div>
         </section>
 
         <!-- MODAL -->
@@ -1120,6 +1135,7 @@
         query: '',
         filtros: { colegiado: '', tipo_processo: '', relator: '' },
         searchStartTime: 0,
+        offset: 0
     };
 
     /* ════════════════════════════════════════
@@ -1153,6 +1169,8 @@
         modalBody: $('#modal-body'),
         modalClose: $('#modal-close'),
         headerStats: $('#header-stats'),
+        loadMoreContainer: $('#load-more-container'),
+        loadMoreBtn: $('#load-more-btn'),
     };
 
     /* ════════════════════════════════════════
@@ -1199,20 +1217,28 @@
     /* ════════════════════════════════════════
        SEARCH
        ════════════════════════════════════════ */
-    async function performSearch() {
-        const query = els.searchInput.value.trim();
+    async function performSearch(isLoadMore = false) {
+        if (!isLoadMore) {
+            state.offset = 0;
+            state.resultados = [];
+            state.query = els.searchInput.value.trim();
+        }
+        
+        const query = state.query;
         if (!query || state.isLoading) return;
 
-        state.query = query;
         state.isLoading = true;
         state.searchStartTime = performance.now();
 
         // UI: compact hero, show loading
-        els.heroSection.classList.add('compact');
-        els.filtersSection.classList.add('visible');
-        els.resultsSection.style.display = 'none';
-        els.emptyState.classList.remove('visible');
-        els.loadingContainer.classList.add('visible');
+        if (!isLoadMore) {
+            els.heroSection.classList.add('compact');
+            els.filtersSection.classList.add('visible');
+            els.resultsSection.style.display = 'none';
+            els.emptyState.classList.remove('visible');
+            els.loadingContainer.classList.add('visible');
+        }
+        
         els.searchBtn.disabled = true;
 
         // Animate loading messages
@@ -1238,6 +1264,7 @@
                     colegiado: els.filterColegiado.value,
                     tipo_processo: els.filterTipo.value,
                     relator: els.filterRelator.value,
+                    offset: state.offset
                 }),
             });
 
@@ -1245,14 +1272,15 @@
             clearInterval(msgInterval);
 
             const elapsed = ((performance.now() - state.searchStartTime) / 1000).toFixed(1);
-            state.resultados = data.resultados || [];
+            const novosResultados = data.resultados || [];
+            state.resultados = isLoadMore ? [...state.resultados, ...novosResultados] : novosResultados;
 
             if (state.resultados.length === 0) {
                 els.loadingContainer.classList.remove('visible');
                 els.emptyState.classList.add('visible');
                 els.emptyMessage.textContent = data.mensagem || 'Tente reformular sua busca usando termos diferentes.';
             } else {
-                renderResults(state.resultados, data.total_candidatos, elapsed);
+                renderResults(elapsed, isLoadMore, novosResultados.length);
             }
         } catch (e) {
             clearInterval(msgInterval);
@@ -1269,16 +1297,20 @@
     /* ════════════════════════════════════════
        RENDER RESULTS
        ════════════════════════════════════════ */
-    function renderResults(resultados, totalCandidatos, elapsed) {
+    function renderResults(elapsed, isLoadMore, newResultsCount) {
         els.loadingContainer.classList.remove('visible');
         els.resultsSection.style.display = 'block';
 
-        els.resultsCount.innerHTML = `<strong>${resultados.length}</strong> resultado${resultados.length !== 1 ? 's' : ''} encontrado${resultados.length !== 1 ? 's' : ''} de ${totalCandidatos} candidatos analisados`;
+        els.resultsCount.innerHTML = `<strong>${state.resultados.length}</strong> resultado${state.resultados.length !== 1 ? 's' : ''} encontrados`;
         els.resultsMeta.textContent = `${elapsed}s · IA + busca textual`;
 
-        els.resultsGrid.innerHTML = '';
+        if (!isLoadMore) {
+            els.resultsGrid.innerHTML = '';
+        }
 
-        resultados.forEach((r, i) => {
+        const resultsToRender = isLoadMore ? state.resultados.slice(state.resultados.length - newResultsCount) : state.resultados;
+
+        resultsToRender.forEach((r, i) => {
             const relevClass = r.relevancia >= 7 ? 'relevance-high' :
                               r.relevancia >= 4 ? 'relevance-medium' : 'relevance-low';
 
@@ -1319,6 +1351,12 @@
 
             els.resultsGrid.appendChild(card);
         });
+
+        if (newResultsCount === 25) {
+            els.loadMoreContainer.style.display = 'flex';
+        } else {
+            els.loadMoreContainer.style.display = 'none';
+        }
     }
 
     /* ════════════════════════════════════════
@@ -1411,10 +1449,8 @@
 
     function formatDecisao(text) {
         if (!text) return '<em>Não disponível</em>';
-        // Break numbered items into paragraphs for readability
         let formatted = escapeHtml(text);
         formatted = formatted.replace(/(9\.\d+\.?)/g, '<br><br><strong>$1</strong>');
-        // Clean up double breaks at start
         formatted = formatted.replace(/^(<br>)+/, '');
         return formatted;
     }
@@ -1424,9 +1460,14 @@
        ════════════════════════════════════════ */
 
     // Search
-    els.searchBtn.addEventListener('click', performSearch);
+    els.searchBtn.addEventListener('click', () => performSearch(false));
     els.searchInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') performSearch();
+        if (e.key === 'Enter') performSearch(false);
+    });
+
+    els.loadMoreBtn.addEventListener('click', () => {
+        state.offset += 25;
+        performSearch(true);
     });
 
     // Suggestion chips
@@ -1434,7 +1475,7 @@
         const chip = e.target.closest('.suggestion-chip');
         if (chip) {
             els.searchInput.value = chip.dataset.query;
-            performSearch();
+            performSearch(false);
         }
     });
 
@@ -1444,12 +1485,12 @@
         els.filterColegiado.value = '';
         els.filterTipo.value = '';
         els.filterRelator.value = '';
-        if (state.query) performSearch();
+        if (state.query) performSearch(false);
     });
 
     [els.filterAno, els.filterColegiado, els.filterTipo, els.filterRelator].forEach(el => {
         el.addEventListener('change', () => {
-            if (state.query) performSearch();
+            if (state.query) performSearch(false);
         });
     });
 
