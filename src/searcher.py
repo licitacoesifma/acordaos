@@ -8,18 +8,89 @@ Implementa tres modos de busca:
 """
 
 import sqlite3
+import threading
 from typing import Optional
 
 import numpy as np
 
 from src.indexer import get_connection
-from src.embedder import blob_para_embedding, obter_embedding_query
+from src.embedder import blob_para_embedding, obter_embedding_query, EMBEDDING_DIM
 
 
 # ──────────────────────────────────────────────
 # Configuracoes
 # ──────────────────────────────────────────────
 RRF_K = 60  # Constante k para Reciprocal Rank Fusion
+
+
+# ──────────────────────────────────────────────
+# Cache da matriz de embeddings (carregada 1x, reusada em todas as buscas)
+# ──────────────────────────────────────────────
+# Em vez de reler todos os embeddings do SQLite e fazer dot product em loop
+# Python a cada requisicao, carregamos uma unica matriz NumPy (N x DIM) e
+# calculamos as similaridades de forma vetorizada. O cache e invalidado
+# automaticamente quando o numero de acordaos com embedding muda (ex: apos
+# uma sincronizacao em background que gerou novos vetores).
+_emb_lock = threading.Lock()
+_emb_cache: dict = {
+    "matriz": None,      # np.ndarray (N, DIM) float32
+    "ids": None,         # np.ndarray (N,) int
+    "assinatura": None,  # (total_com_embedding,) para deteccao de mudanca
+}
+
+
+def _assinatura_embeddings(conn: sqlite3.Connection) -> int:
+    """Retorna a contagem de embeddings, usada para detectar mudancas no cache."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM acordaos WHERE embedding IS NOT NULL"
+    ).fetchone()[0]
+
+
+def _carregar_matriz_embeddings(conn: sqlite3.Connection):
+    """Carrega (ou recarrega) a matriz de embeddings em memoria.
+
+    Thread-safe e idempotente: so recarrega se a assinatura mudou.
+
+    Returns:
+        Tupla (matriz NxDIM, ids Nx1) ou (None, None) se nao ha embeddings.
+    """
+    assinatura = _assinatura_embeddings(conn)
+
+    with _emb_lock:
+        if _emb_cache["assinatura"] == assinatura and _emb_cache["matriz"] is not None:
+            return _emb_cache["matriz"], _emb_cache["ids"]
+
+        rows = conn.execute(
+            "SELECT id, embedding FROM acordaos WHERE embedding IS NOT NULL ORDER BY id"
+        ).fetchall()
+
+        ids_validos = []
+        vetores = []
+        for row in rows:
+            emb = blob_para_embedding(row["embedding"])
+            if emb is None:  # pula embeddings corrompidos/dimensao errada
+                continue
+            ids_validos.append(row["id"])
+            vetores.append(emb)
+
+        if not vetores:
+            _emb_cache.update(matriz=None, ids=None, assinatura=assinatura)
+            return None, None
+
+        matriz = np.vstack(vetores).astype(np.float32)
+        ids = np.array(ids_validos, dtype=np.int64)
+
+        _emb_cache.update(matriz=matriz, ids=ids, assinatura=assinatura)
+        return matriz, ids
+
+
+def invalidar_cache_embeddings() -> None:
+    """Forca o recarregamento da matriz na proxima busca semantica.
+
+    Deve ser chamada apos gerar novos embeddings (ex: sincronizacao).
+    """
+    with _emb_lock:
+        _emb_cache.update(matriz=None, ids=None, assinatura=None)
 
 
 def busca_lexical(
@@ -134,50 +205,87 @@ def busca_semantica(
     Returns:
         Lista de dicionarios com os resultados, incluindo score de similaridade.
     """
-    # Gera embedding da query
-    query_embedding = obter_embedding_query(model, query)
-
-    # Busca embeddings filtrados
-    sql = """
-        SELECT id, chave, titulo, tipo, numero_acordao, ano, colegiado,
-               relator, tipo_processo, entidade, assunto, sumario, conteudo, embedding
-        FROM acordaos
-        WHERE embedding IS NOT NULL
-          AND (? = '' OR ano = ?)
-          AND (? = '' OR colegiado = ?)
-          AND (? = '' OR relator = ?)
-          AND (? = '' OR tipo_processo = ?)
-    """
-    
-    params = (
-        ano, ano,
-        colegiado, colegiado,
-        relator, relator,
-        tipo_processo, tipo_processo
-    )
-    
-    rows = conn.execute(sql, params).fetchall()
-
-    if not rows:
+    query = (query or "").strip()
+    if not query:
         return []
 
-    # Calcula similaridade de cosseno para cada acordao
-    scores = []
-    for row in rows:
-        emb = blob_para_embedding(row["embedding"])
-        # Como os embeddings ja sao normalizados, cosseno = dot product
-        sim = float(np.dot(query_embedding, emb))
-        scores.append((sim, dict(row)))
+    # Gera embedding da query (normalizado)
+    query_embedding = np.asarray(
+        obter_embedding_query(model, query), dtype=np.float32
+    )
 
-    # Ordena por similaridade decrescente
-    scores.sort(key=lambda x: x[0], reverse=True)
+    # Carrega a matriz de embeddings em memoria (cacheada)
+    matriz, ids = _carregar_matriz_embeddings(conn)
+    if matriz is None or matriz.shape[0] == 0:
+        return []
+
+    # Similaridade de cosseno vetorizada: como tudo esta normalizado,
+    # cosseno = produto interno. matriz (N, DIM) @ query (DIM,) -> (N,)
+    sims = matriz @ query_embedding
+
+    # Se ha filtros, restringe aos IDs permitidos via SQL
+    tem_filtro = any([ano, colegiado, relator, tipo_processo])
+    ids_permitidos: Optional[set] = None
+    if tem_filtro:
+        sql_ids = """
+            SELECT id FROM acordaos
+            WHERE embedding IS NOT NULL
+              AND (? = '' OR ano = ?)
+              AND (? = '' OR colegiado = ?)
+              AND (? = '' OR relator = ?)
+              AND (? = '' OR tipo_processo = ?)
+        """
+        params = (
+            ano, ano,
+            colegiado, colegiado,
+            relator, relator,
+            tipo_processo, tipo_processo,
+        )
+        ids_permitidos = {r[0] for r in conn.execute(sql_ids, params).fetchall()}
+        if not ids_permitidos:
+            return []
+
+    # Ordena todos os indices por similaridade decrescente (argsort e barato)
+    ordem = np.argsort(-sims)
+
+    # Coleta os IDs+scores finais respeitando filtro, offset e top_k
+    selecionados: list[tuple[int, float]] = []
+    pulados = 0
+    for idx in ordem:
+        acordao_id = int(ids[idx])
+        if ids_permitidos is not None and acordao_id not in ids_permitidos:
+            continue
+        if pulados < offset:
+            pulados += 1
+            continue
+        selecionados.append((acordao_id, float(sims[idx])))
+        if len(selecionados) >= top_k:
+            break
+
+    if not selecionados:
+        return []
+
+    # Busca os metadados apenas dos selecionados (1 query, preservando a ordem)
+    id_lista = [sid for sid, _ in selecionados]
+    placeholders = ",".join("?" for _ in id_lista)
+    linhas = conn.execute(
+        f"""
+        SELECT id, chave, titulo, tipo, numero_acordao, ano, colegiado,
+               relator, tipo_processo, entidade, assunto, sumario, conteudo
+        FROM acordaos WHERE id IN ({placeholders})
+        """,
+        id_lista,
+    ).fetchall()
+    por_id = {row["id"]: dict(row) for row in linhas}
 
     resultados = []
-    for score, dados in scores[offset:offset + top_k]:
+    for acordao_id, score in selecionados:
+        dados = por_id.get(acordao_id)
+        if dados is None:
+            continue
         dados["score"] = score
-        dados["trecho"] = _extrair_trecho(dados["conteudo"], query)
+        dados["trecho"] = _extrair_trecho(dados.get("conteudo", ""), query)
         dados.pop("conteudo", None)
-        dados.pop("embedding", None)
         resultados.append(dados)
 
     return resultados
@@ -212,8 +320,12 @@ def busca_hibrida(
     Returns:
         Lista de dicionarios com os resultados combinados.
     """
-    # Busca mais resultados intermediarios para ter uma boa cobertura
-    search_scope = (offset + top_k) * 3
+    if not (query or "").strip():
+        return []
+
+    # Busca mais resultados intermediarios para ter uma boa cobertura na fusao.
+    # Minimo de 50 garante fusao util mesmo para top_k pequeno.
+    search_scope = max(50, (offset + top_k) * 3)
     resultados_lex = busca_lexical(
         conn, query, top_k=search_scope, offset=0,
         ano=ano, colegiado=colegiado, relator=relator, tipo_processo=tipo_processo
@@ -256,6 +368,34 @@ def busca_hibrida(
         resultados.append(dados)
 
     return resultados
+
+
+def calcular_relevancia(resultados: list[dict]) -> None:
+    """Adiciona um campo 'relevancia' (1 a 10) baseado no SCORE REAL.
+
+    Aplica normalizacao min-max sobre os scores efetivamente retornados,
+    preservando as diferencas relativas de qualidade entre os resultados.
+    Modifica a lista in-place. Diferente de uma escala por posicao, aqui
+    dois resultados com scores muito proximos recebem relevancias proximas,
+    e um resultado fraco no topo NAO recebe nota maxima artificialmente.
+
+    Args:
+        resultados: Lista de dicionarios contendo a chave 'score'.
+    """
+    if not resultados:
+        return
+
+    scores = [float(r.get("score", 0.0)) for r in resultados]
+    s_min, s_max = min(scores), max(scores)
+    intervalo = s_max - s_min
+
+    for r, s in zip(resultados, scores):
+        if intervalo <= 1e-12:
+            # Todos os scores praticamente iguais: relevancia uniforme alta
+            r["relevancia"] = 10
+        else:
+            norm = (s - s_min) / intervalo  # 0.0 .. 1.0
+            r["relevancia"] = int(round(1 + norm * 9))  # 1 .. 10
 
 
 def _extrair_trecho(conteudo: str, query: str, tamanho: int = 300) -> str:

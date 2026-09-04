@@ -2,11 +2,11 @@
 Script principal do Sistema de Busca de Acordaos do TCU.
 
 Uso:
-    python main.py --indexar              Chunking + indexacao SQLite + embeddings
-    python main.py --buscar "termo"       Busca hibrida nos acordaos
-    python main.py --buscar "termo" -k 5  Define o numero de resultados
-    python main.py --buscar "termo" --modo lexical   Apenas busca lexical
-    python main.py --buscar "termo" --modo semantica Apenas busca semantica
+    python cli.py --indexar              Chunking + indexacao SQLite + embeddings
+    python cli.py --buscar "termo"       Busca hibrida nos acordaos
+    python cli.py --buscar "termo" -k 5  Define o numero de resultados
+    python cli.py --buscar "termo" --modo lexical   Apenas busca lexical
+    python cli.py --buscar "termo" --modo semantica Apenas busca semantica
 """
 
 import argparse
@@ -77,7 +77,7 @@ def executar_busca(query: str, top_k: int = 10, modo: str = "hibrida") -> None:
 
     total = conn.execute("SELECT COUNT(*) FROM acordaos").fetchone()[0]
     if total == 0:
-        print("[ERRO] Banco de dados vazio. Execute 'python main.py --indexar' primeiro.")
+        print("[ERRO] Banco de dados vazio. Execute 'python cli.py --indexar' primeiro.")
         sys.exit(1)
 
     print(f"\n{'='*70}")
@@ -119,10 +119,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos:
-  python main.py --indexar
-  python main.py --buscar "licitacao irregularidade"
-  python main.py --buscar "dano ao erario" -k 5
-  python main.py --buscar "pregao eletronico" --modo lexical
+  python cli.py --indexar
+  python cli.py --buscar "licitacao irregularidade"
+  python cli.py --buscar "dano ao erario" -k 5
+  python cli.py --buscar "pregao eletronico" --modo lexical
         """,
     )
 

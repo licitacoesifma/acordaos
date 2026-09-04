@@ -2,15 +2,17 @@
 API FastAPI para Busca de Acordaos do TCU.
 
 Endpoints:
-    GET  /              -> Serve o index.html
-    GET  /buscar        -> Busca hibrida nos acordaos
-    GET  /api/filtros   -> Retorna opcoes de filtros disponiveis
-    GET  /api/stats     -> Estatisticas do banco de dados
+    GET  /                     -> Serve o index.html
+    POST /api/buscar           -> Busca lexical / semantica / hibrida
+    POST /api/resumir          -> Resume um acordao via LLM
+    GET  /api/filtros          -> Opcoes de filtros e temas em alta
+    GET  /api/stats            -> Estatisticas do banco de dados
+    GET  /api/acordao/{chave}  -> Retorna um acordao completo
 
 Uso:
-    python server.py
+    python main.py
     # ou
-    uvicorn server:app --reload --port 5000
+    uvicorn main:app --reload --port 5000
 """
 
 import os
@@ -29,7 +31,13 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from src.indexer import get_connection, contar_acordaos, inserir_acordaos
-from src.searcher import busca_lexical, busca_semantica, busca_hibrida
+from src.searcher import (
+    busca_lexical,
+    busca_semantica,
+    busca_hibrida,
+    calcular_relevancia,
+    invalidar_cache_embeddings,
+)
 from src.chunker import carregar_todos_acordaos
 from src.embedder import gerar_embeddings
 
@@ -85,8 +93,11 @@ def _sync_novos_acordaos():
         if inseridos > 0 or com_embedding < total:
             model = _get_model()
             gerar_embeddings(conn, model)
+            # Novos vetores no banco: invalida o cache em memoria da busca
+            # semantica para que a proxima busca recarregue a matriz atualizada.
+            invalidar_cache_embeddings()
             print(f"[INFO] Sincronização concluída. {total - com_embedding} novos embeddings gerados.")
-            
+
     except Exception as e:
         print(f"[ERRO] Falha na sincronização em background: {e}")
     finally:
@@ -103,7 +114,7 @@ async def lifespan(app: FastAPI):
     print(f"[INFO] Banco de dados carregado: {total} acordaos")
 
     if total == 0:
-        print("[AVISO] Banco vazio. Execute 'python main.py --indexar' primeiro.")
+        print("[AVISO] Banco vazio. Execute 'python cli.py --indexar' primeiro.")
 
     yield
 
@@ -154,8 +165,6 @@ async def index(background_tasks: BackgroundTasks):
     )
 
 
-from pydantic import BaseModel
-
 class BuscaRequest(BaseModel):
     query: str
     colegiado: str = ""
@@ -198,15 +207,14 @@ async def buscar(req: BuscaRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro na busca: {str(e)}")
 
-    # Mapeamento para compatibilidade com o frontend antigo
-    for i, r in enumerate(resultados):
+    # Relevancia (1 a 10) derivada do SCORE REAL via normalizacao min-max,
+    # e nao da posicao na lista. Preserva as diferencas de qualidade.
+    calcular_relevancia(resultados)
+
+    # Mapeamento para compatibilidade com o frontend
+    for r in resultados:
         r["key"] = r.get("chave", "")
         r["resumo"] = r.get("trecho", r.get("sumario", ""))
-        
-        # Mapeia a relevancia para uma escala de 1 a 10 esperada pelo frontend
-        # Para evitar complexidade de normalizar scores lexicais/semanticos,
-        # geramos uma relevancia baseada na posicao global (offset + i)
-        r["relevancia"] = max(1, 10 - (req.offset + i))
 
     return {
         "query": req.query,
@@ -223,14 +231,28 @@ class ResumoRequest(BaseModel):
 
 @app.post("/api/resumir")
 async def resumir(req: ResumoRequest):
-    """Gera um resumo do acórdão usando LLM."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key or api_key == "sua_chave_aqui":
-        raise HTTPException(status_code=401, detail="API Key não configurada. Defina OPENAI_API_KEY no arquivo .env.")
+    """Gera um resumo do acórdão usando LLM.
+
+    Provedor, modelo e base_url sao configuraveis por variaveis de ambiente:
+        LLM_API_KEY   (fallback: OPENAI_API_KEY)
+        LLM_BASE_URL  (default: https://api.tokenrouter.com/v1)
+        LLM_MODEL     (default: z-ai/glm-5.3-free)
+    """
+    # Aceita LLM_API_KEY (novo) ou OPENAI_API_KEY (compat. legado)
+    api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    placeholders = {"", "sua_chave_aqui", "your_api_key_here", "sk-sua_chave_aqui"}
+    if not api_key or api_key.strip() in placeholders:
+        raise HTTPException(
+            status_code=401,
+            detail="Chave de API não configurada. Defina LLM_API_KEY (ou OPENAI_API_KEY) no arquivo .env.",
+        )
+
+    base_url = os.environ.get("LLM_BASE_URL", "https://api.tokenrouter.com/v1")
+    modelo_llm = os.environ.get("LLM_MODEL", "z-ai/glm-5.3-free")
 
     conn = _get_conn()
     row = conn.execute("SELECT conteudo FROM acordaos WHERE chave = ?", (req.chave,)).fetchone()
-    
+
     if not row or not row[0]:
         raise HTTPException(status_code=404, detail="Acórdão não encontrado ou sem conteúdo.")
 
@@ -238,7 +260,7 @@ async def resumir(req: ResumoRequest):
 
     try:
         client = OpenAI(
-            base_url='https://api.tokenrouter.com/v1',
+            base_url=base_url,
             api_key=api_key,
         )
 
@@ -246,20 +268,23 @@ async def resumir(req: ResumoRequest):
             {
                 "role": "system", 
                 "content": (
-                    "Você é um especialista jurídico do Tribunal de Contas da União. "
-                    "Faça um resumo DIRETO, SÓLIDO e MUITO CONCISO (máximo 3 parágrafos fluidos) focado "
-                    "exclusivamente em responder:\n"
-                    "1. Do que se trata o acórdão (o fato principal).\n"
-                    "2. Quais as consequências geradas (impactos/irregularidades).\n"
-                    "3. O Veredito final (o que foi aplicado aos responsáveis e o porquê).\n"
-                    "Não use Markdown, listas ou bullet points. Escreva apenas os parágrafos corridos respondendo a essas questões de forma madura."
+                    "Você é um especialista em jurisprudência do TCU aplicada a licitações e contratos (Lei 14.133/2021).\n\n"
+                    "REGRAS DE FIDELIDADE E FORMATO (obrigatórias):\n"
+                    "- Escreva um resumo humanizado em texto corrido (apenas parágrafos coesos). NÃO utilize NENHUMA formatação markdown (como negrito, itálico, listas, subtítulos ou tópicos numerados).\n"
+                    "- NÃO inclua e não mencione número do acórdão, órgão, colegiado ou relator (pois essa informação já é mostrada no sistema).\n"
+                    "- Use SOMENTE as informações contidas no texto fornecido abaixo. NÃO utilize conhecimento prévio sobre este ou outros acórdãos.\n"
+                    "- Artigos de lei, valores monetários e datas devem ser reproduzidos EXATAMENTE como aparecem no texto.\n"
+                    "- Separe claramente no texto o que é FATO RELATADO do que é sua INTERPRETAÇÃO/aplicação prática.\n\n"
+                    "O seu resumo deve abordar o caso fluindo organicamente pelos pontos essenciais: "
+                    "a tese/enunciado principal (regra fixada), o contexto fático do caso, a fundamentação legal citada, "
+                    "a aplicação prática na rotina de um pregoeiro, e a relevância da decisão (alta, média ou baixa, com justificativa)."
                 )
             },
             {"role": "user", "content": f"Acórdão: {conteudo[:12000]}"},
         ]
 
         stream = client.chat.completions.create(
-            model="z-ai/glm-5.3-free",
+            model=modelo_llm,
             messages=messages,
             stream=True,
             stream_options={"include_usage": True},
@@ -273,8 +298,15 @@ async def resumir(req: ResumoRequest):
                 if delta and delta.content:
                     content_parts.append(delta.content)
 
-        full_content = "".join(content_parts)
+        full_content = "".join(content_parts).strip()
+        if not full_content:
+            raise HTTPException(
+                status_code=502,
+                detail="A IA retornou uma resposta vazia. Tente novamente.",
+            )
         return {"resumo": full_content}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao conectar com a IA: {str(e)}")
 

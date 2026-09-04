@@ -22,6 +22,7 @@ from src.indexer import get_connection, atualizar_embedding, buscar_todos_ids_co
 # ──────────────────────────────────────────────
 MODEL_NAME = "SamuelMauli/parity-embedding-juridico-br-v4"
 BATCH_SIZE = 32  # Tamanho do batch para encoding
+EMBEDDING_DIM = 384  # Dimensao esperada do vetor (compativel com vector(384) do pgvector)
 
 
 def carregar_modelo():
@@ -34,7 +35,15 @@ def carregar_modelo():
 
     print(f"[INFO] Carregando modelo: {MODEL_NAME}")
     model = SentenceTransformer(MODEL_NAME)
-    print(f"[INFO] Modelo carregado. Dimensao do embedding: {model.get_embedding_dimension()}")
+
+    # get_sentence_embedding_dimension() e a API correta do sentence-transformers.
+    # Protegido para nunca derrubar o carregamento por causa de um log informativo.
+    try:
+        dim = model.get_sentence_embedding_dimension()
+        print(f"[INFO] Modelo carregado. Dimensao do embedding: {dim}")
+    except Exception:
+        print("[INFO] Modelo carregado.")
+
     return model
 
 
@@ -45,21 +54,40 @@ def embedding_para_blob(embedding: np.ndarray) -> bytes:
         embedding: Vetor numpy de floats.
 
     Returns:
-        Representacao em bytes do vetor.
+        Representacao em bytes do vetor (contiguo, float32).
     """
-    return embedding.astype(np.float32).tobytes()
+    # np.ascontiguousarray garante buffer contiguo antes de .tobytes()
+    return np.ascontiguousarray(embedding, dtype=np.float32).tobytes()
 
 
-def blob_para_embedding(blob: bytes) -> np.ndarray:
+def blob_para_embedding(blob: Optional[bytes]) -> Optional[np.ndarray]:
     """Deserializa bytes (BLOB) para vetor numpy float32.
 
+    Retorna None quando o blob esta ausente ou corrompido (tamanho
+    incompativel com a dimensao esperada), permitindo que o chamador
+    pule silenciosamente registros invalidos em vez de quebrar a busca.
+
     Args:
-        blob: Bytes armazenados no SQLite.
+        blob: Bytes armazenados no SQLite (ou None).
 
     Returns:
-        Vetor numpy float32 reconstruido.
+        Vetor numpy float32 reconstruido, ou None se invalido.
     """
-    return np.frombuffer(blob, dtype=np.float32)
+    if not blob:
+        return None
+
+    # np.frombuffer exige que len(blob) seja multiplo de 4 (float32);
+    # bytes corrompidos disparam ValueError, entao protegemos.
+    try:
+        vetor = np.frombuffer(blob, dtype=np.float32)
+    except ValueError:
+        return None
+
+    # Valida o tamanho contra a dimensao esperada.
+    if vetor.shape[0] != EMBEDDING_DIM:
+        return None
+
+    return vetor
 
 
 def gerar_embeddings(conn: sqlite3.Connection, model=None) -> int:
@@ -85,7 +113,9 @@ def gerar_embeddings(conn: sqlite3.Connection, model=None) -> int:
         return 0
 
     ids = [row["id"] for row in rows]
-    conteudos = [row["conteudo"] for row in rows]
+    # Conteudo vazio geraria um vetor degenerado; usa o titulo como fallback
+    # so no encode (nao altera o que esta salvo na coluna conteudo).
+    conteudos = [(row["conteudo"] or "").strip() or "documento sem conteudo" for row in rows]
 
     print(f"[INFO] Gerando embeddings para {len(conteudos)} acordaos...")
 
@@ -105,6 +135,9 @@ def gerar_embeddings(conn: sqlite3.Connection, model=None) -> int:
             blob = embedding_para_blob(emb)
             atualizar_embedding(conn, acordao_id, blob)
 
+        # Commit por batch: se o processo cair no meio de uma base grande,
+        # o progresso ja gravado nao e perdido (retomavel na proxima execucao).
+        conn.commit()
         total_gerados += len(batch_ids)
 
     conn.commit()
