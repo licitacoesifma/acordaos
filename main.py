@@ -17,6 +17,7 @@ Uso:
 
 import os
 import sys
+import threading
 from typing import Optional
 from contextlib import asynccontextmanager
 import asyncio
@@ -44,12 +45,41 @@ from src.embedder import gerar_embeddings
 # Carrega variáveis de ambiente
 load_dotenv()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # ──────────────────────────────────────────────
 # Estado global da aplicacao
 # ──────────────────────────────────────────────
 _model = None
 _conn = None
 _sync_in_progress = False
+_last_data_signature = None
+
+# Os endpoints agora rodam em threads do threadpool do FastAPI (ver `def`
+# em vez de `async def` nas rotas abaixo), entao a conexao SQLite global
+# (compartilhada, com check_same_thread=False) passa a ser acessada por
+# multiplas threads ao mesmo tempo. O modulo sqlite3 NAO garante isso
+# como seguro por si so — este lock serializa o acesso para evitar
+# corrupcao/erros de concorrencia.
+_conn_lock = threading.Lock()
+
+
+def _assinatura_pasta_data(data_dir: str):
+    """Assinatura barata (nome, tamanho, mtime) dos .md em data/.
+
+    Usada para pular o reparsing caro dos Markdowns quando nada mudou
+    desde a ultima sincronizacao (evita reprocessar dezenas de MB a
+    cada acesso a pagina inicial).
+    """
+    if not os.path.isdir(data_dir):
+        return None
+    arquivos = []
+    for nome in sorted(os.listdir(data_dir)):
+        if nome.endswith(".md"):
+            caminho = os.path.join(data_dir, nome)
+            stat = os.stat(caminho)
+            arquivos.append((nome, stat.st_size, stat.st_mtime))
+    return tuple(arquivos)
 
 def _get_model():
     """Carrega o modelo de embeddings (lazy loading)."""
@@ -68,31 +98,41 @@ def _get_conn():
 
 def _sync_novos_acordaos():
     """Tarefa em background para buscar novos arquivos em data/ e indexar."""
-    global _sync_in_progress
+    global _sync_in_progress, _last_data_signature
     if _sync_in_progress:
         return
-        
+
     _sync_in_progress = True
     try:
-        conn = _get_conn()
-        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
         DATA_DIR = os.path.join(BASE_DIR, "data")
-        
+
+        # Pula o reparsing caro (MDs de dezenas de MB) se nada mudou em
+        # data/ desde a ultima sincronizacao: esta funcao roda a cada
+        # acesso a "/", entao sem isso o servidor reprocessaria os
+        # mesmos arquivos gigantes em toda visita a home.
+        assinatura = _assinatura_pasta_data(DATA_DIR)
+        if assinatura is not None and assinatura == _last_data_signature:
+            return
+
+        conn = _get_conn()
+
         # 1. Carrega todos os acórdãos dos arquivos MD
         acordaos = carregar_todos_acordaos(DATA_DIR)
+        _last_data_signature = assinatura
         if not acordaos:
             return
-            
+
         # 2. Insere no banco (INSERT OR IGNORE cuida para não duplicar)
-        inseridos = inserir_acordaos(conn, acordaos)
-        
+        with _conn_lock:
+            inseridos = inserir_acordaos(conn, acordaos)
+            com_embedding = conn.execute("SELECT COUNT(*) FROM acordaos WHERE embedding IS NOT NULL").fetchone()[0]
+            total = contar_acordaos(conn)
+
         # 3. Se houve novos inseridos ou há acórdãos sem embedding, atualiza
-        com_embedding = conn.execute("SELECT COUNT(*) FROM acordaos WHERE embedding IS NOT NULL").fetchone()[0]
-        total = contar_acordaos(conn)
-        
         if inseridos > 0 or com_embedding < total:
             model = _get_model()
-            gerar_embeddings(conn, model)
+            with _conn_lock:
+                gerar_embeddings(conn, model)
             # Novos vetores no banco: invalida o cache em memoria da busca
             # semantica para que a proxima busca recarregue a matriz atualizada.
             invalidar_cache_embeddings()
@@ -137,12 +177,11 @@ app = FastAPI(
 )
 
 # Servir arquivos estáticos (CSS, JS, Imagens)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -156,7 +195,7 @@ async def index(background_tasks: BackgroundTasks):
     """Serve a pagina principal e dispara sincronização em background."""
     background_tasks.add_task(_sync_novos_acordaos)
     
-    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+    html_path = os.path.join(BASE_DIR, "index.html")
     if os.path.exists(html_path):
         return FileResponse(html_path)
     return JSONResponse(
@@ -176,7 +215,7 @@ class BuscaRequest(BaseModel):
     modo: str = "hibrida"
 
 @app.post("/api/buscar")
-async def buscar(req: BuscaRequest):
+def buscar(req: BuscaRequest):
     """Endpoint principal de busca.
 
     Realiza busca nos acordaos indexados usando o modo especificado.
@@ -187,23 +226,24 @@ async def buscar(req: BuscaRequest):
         raise HTTPException(status_code=400, detail="Modo invalido. Use: lexical, semantica ou hibrida")
 
     try:
-        if req.modo == "lexical":
-            resultados = busca_lexical(
-                conn, req.query, top_k=req.top_k, offset=req.offset,
-                ano=req.ano, colegiado=req.colegiado, relator=req.relator, tipo_processo=req.tipo_processo
-            )
-        elif req.modo == "semantica":
-            model = _get_model()
-            resultados = busca_semantica(
-                conn, req.query, model, top_k=req.top_k, offset=req.offset,
-                ano=req.ano, colegiado=req.colegiado, relator=req.relator, tipo_processo=req.tipo_processo
-            )
-        else:  # hibrida
-            model = _get_model()
-            resultados = busca_hibrida(
-                conn, req.query, model, top_k=req.top_k, offset=req.offset,
-                ano=req.ano, colegiado=req.colegiado, relator=req.relator, tipo_processo=req.tipo_processo
-            )
+        with _conn_lock:
+            if req.modo == "lexical":
+                resultados = busca_lexical(
+                    conn, req.query, top_k=req.top_k, offset=req.offset,
+                    ano=req.ano, colegiado=req.colegiado, relator=req.relator, tipo_processo=req.tipo_processo
+                )
+            elif req.modo == "semantica":
+                model = _get_model()
+                resultados = busca_semantica(
+                    conn, req.query, model, top_k=req.top_k, offset=req.offset,
+                    ano=req.ano, colegiado=req.colegiado, relator=req.relator, tipo_processo=req.tipo_processo
+                )
+            else:  # hibrida
+                model = _get_model()
+                resultados = busca_hibrida(
+                    conn, req.query, model, top_k=req.top_k, offset=req.offset,
+                    ano=req.ano, colegiado=req.colegiado, relator=req.relator, tipo_processo=req.tipo_processo
+                )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro na busca: {str(e)}")
 
@@ -230,7 +270,7 @@ class ResumoRequest(BaseModel):
     chave: str
 
 @app.post("/api/resumir")
-async def resumir(req: ResumoRequest):
+def resumir(req: ResumoRequest):
     """Gera um resumo do acórdão usando LLM.
 
     Provedor, modelo e base_url sao configuraveis por variaveis de ambiente:
@@ -251,7 +291,8 @@ async def resumir(req: ResumoRequest):
     modelo_llm = os.environ.get("LLM_MODEL", "z-ai/glm-5.3-free")
 
     conn = _get_conn()
-    row = conn.execute("SELECT conteudo FROM acordaos WHERE chave = ?", (req.chave,)).fetchone()
+    with _conn_lock:
+        row = conn.execute("SELECT conteudo FROM acordaos WHERE chave = ?", (req.chave,)).fetchone()
 
     if not row or not row[0]:
         raise HTTPException(status_code=404, detail="Acórdão não encontrado ou sem conteúdo.")
@@ -311,50 +352,53 @@ async def resumir(req: ResumoRequest):
         raise HTTPException(status_code=500, detail=f"Erro ao conectar com a IA: {str(e)}")
 
 @app.get("/api/filtros")
-async def filtros():
+def filtros():
     """Retorna opcoes de filtros disponiveis para a interface."""
     conn = _get_conn()
 
-    colegiados = [r[0] for r in conn.execute(
-        "SELECT DISTINCT colegiado FROM acordaos WHERE colegiado != '' ORDER BY colegiado"
-    ).fetchall()]
+    with _conn_lock:
+        colegiados = [r[0] for r in conn.execute(
+            "SELECT DISTINCT colegiado FROM acordaos WHERE colegiado != '' ORDER BY colegiado"
+        ).fetchall()]
 
-    tipos_processo = [r[0] for r in conn.execute(
-        "SELECT DISTINCT tipo_processo FROM acordaos WHERE tipo_processo != '' ORDER BY tipo_processo"
-    ).fetchall()]
+        tipos_processo = [r[0] for r in conn.execute(
+            "SELECT DISTINCT tipo_processo FROM acordaos WHERE tipo_processo != '' ORDER BY tipo_processo"
+        ).fetchall()]
 
-    relatores = [r[0] for r in conn.execute(
-        "SELECT DISTINCT relator FROM acordaos WHERE relator != '' ORDER BY relator"
-    ).fetchall()]
+        relatores = [r[0] for r in conn.execute(
+            "SELECT DISTINCT relator FROM acordaos WHERE relator != '' ORDER BY relator"
+        ).fetchall()]
 
-    anos = [r[0] for r in conn.execute(
-        "SELECT DISTINCT ano FROM acordaos WHERE ano != '' ORDER BY ano DESC"
-    ).fetchall()]
+        anos = [r[0] for r in conn.execute(
+            "SELECT DISTINCT ano FROM acordaos WHERE ano != '' ORDER BY ano DESC"
+        ).fetchall()]
 
-    # Definir macro-temas e as queries FTS (expressões) para buscar no conteúdo
-    macro_temas = {
-        "Licitação e Contratos": "licita* OR contrato* OR pregão OR certame OR edital",
-        "Aposentadoria e Pensão": "aposentadoria OR pensão OR previdenciário OR inativo",
-        "Tomada de Contas": "tomada de contas especial OR TCE",
-        "Obras Públicas": "obras OR engenharia OR rodovia OR pavimentação",
-        "Convênios e Repasses": "convênio OR repasse OR prestação de contas",
-        "Fraude e Sobrepreço": "fraude OR sobrepreço OR superfaturamento OR desvio",
-        "Pessoal e Concurso": "pessoal OR concurso OR admissão OR remuneração",
-        "Auditoria e Inspeção": "auditoria OR inspeção OR fiscalização"
-    }
+        # Definir macro-temas e as queries FTS (expressões) para buscar no conteúdo
+        macro_temas = {
+            "Licitação e Contratos": "licita* OR contrato* OR pregão OR certame OR edital",
+            "Aposentadoria e Pensão": "aposentadoria OR pensão OR previdenciário OR inativo",
+            "Tomada de Contas": "tomada de contas especial OR TCE",
+            "Obras Públicas": "obras OR engenharia OR rodovia OR pavimentação",
+            "Convênios e Repasses": "convênio OR repasse OR prestação de contas",
+            "Fraude e Sobrepreço": "fraude OR sobrepreço OR superfaturamento OR desvio",
+            "Pessoal e Concurso": "pessoal OR concurso OR admissão OR remuneração",
+            "Auditoria e Inspeção": "auditoria OR inspeção OR fiscalização"
+        }
 
-    tema_counts = {}
-    for tema, query_fts in macro_temas.items():
-        try:
-            # Conta quantos acórdãos têm essas palavras no teor
-            count = conn.execute("SELECT COUNT(*) FROM acordaos_fts WHERE acordaos_fts MATCH ?", (query_fts,)).fetchone()[0]
-            tema_counts[tema] = count
-        except Exception:
-            tema_counts[tema] = 0
+        tema_counts = {}
+        for tema, query_fts in macro_temas.items():
+            try:
+                # Conta quantos acórdãos têm essas palavras no teor
+                count = conn.execute("SELECT COUNT(*) FROM acordaos_fts WHERE acordaos_fts MATCH ?", (query_fts,)).fetchone()[0]
+                tema_counts[tema] = count
+            except Exception:
+                tema_counts[tema] = 0
 
-    # Pega os 5 temas com maiores contagens (que não sejam 0)
-    top_5_temas = sorted(tema_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-    top_assuntos = [t[0] for t in top_5_temas if t[1] > 0]
+        # Pega os 5 temas com maiores contagens (que não sejam 0)
+        top_5_temas = sorted(tema_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_assuntos = [t[0] for t in top_5_temas if t[1] > 0]
+
+        total_acordaos = contar_acordaos(conn)
 
     return {
         "colegiados": colegiados,
@@ -362,19 +406,20 @@ async def filtros():
         "relatores": relatores,
         "anos": anos,
         "top_assuntos": top_assuntos,
-        "total_acordaos": contar_acordaos(conn),
+        "total_acordaos": total_acordaos,
     }
 
 
 @app.get("/api/stats")
-async def stats():
+def stats():
     """Retorna estatisticas do banco de dados."""
     conn = _get_conn()
 
-    total = contar_acordaos(conn)
-    com_embedding = conn.execute(
-        "SELECT COUNT(*) FROM acordaos WHERE embedding IS NOT NULL"
-    ).fetchone()[0]
+    with _conn_lock:
+        total = contar_acordaos(conn)
+        com_embedding = conn.execute(
+            "SELECT COUNT(*) FROM acordaos WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
 
     return {
         "total_acordaos": total,
@@ -385,7 +430,7 @@ async def stats():
 
 
 @app.get("/api/acordao/{chave}")
-async def acordao_detalhe(chave: str):
+def acordao_detalhe(chave: str):
     """Retorna o acordao completo por chave.
 
     Args:
@@ -395,12 +440,13 @@ async def acordao_detalhe(chave: str):
         JSON com todos os campos do acordao.
     """
     conn = _get_conn()
-    row = conn.execute(
-        "SELECT id, chave, tipo, titulo, numero_acordao, ano, colegiado, "
-        "relator, tipo_processo, entidade, assunto, sumario, conteudo "
-        "FROM acordaos WHERE chave = ?",
-        (chave,),
-    ).fetchone()
+    with _conn_lock:
+        row = conn.execute(
+            "SELECT id, chave, tipo, titulo, numero_acordao, ano, colegiado, "
+            "relator, tipo_processo, entidade, assunto, sumario, conteudo "
+            "FROM acordaos WHERE chave = ?",
+            (chave,),
+        ).fetchone()
 
     if not row:
         raise HTTPException(status_code=404, detail="Acordao nao encontrado")
@@ -408,7 +454,8 @@ async def acordao_detalhe(chave: str):
     result = dict(row)
     result["decisao"] = result.get("conteudo", "")
     result["numero"] = result.get("numero_acordao", "")
-    
+    result["key"] = result.get("chave", "")
+
     return result
 
 # ──────────────────────────────────────────────
