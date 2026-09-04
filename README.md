@@ -1,77 +1,84 @@
-# Sistema de Busca de Acórdãos TCU
+# TCU Busca IA 🏛️✨
 
-Um motor de busca avançado projetado para indexar e pesquisar decisões (acórdãos) do Tribunal de Contas da União (TCU). O sistema realiza a extração de dados brutos em Markdown e constrói uma API ultrarrápida combinando buscas por palavra-chave e compreensão semântica, proporcionando resultados altamente relevantes e precisos.
+Um sistema de busca avançado e offline para acórdãos do Tribunal de Contas da União (TCU). 
+Este projeto combina buscas lexicais de alta performance (FTS5) com inteligência artificial para buscas semânticas (Embeddings) e sumarização generativa, garantindo resultados cirúrgicos mesmo em bases de dados com milhares de processos.
 
-## 🚀 Arquitetura e Tecnologias
+## 🚀 Funcionalidades
 
-- **Motor Lexical (Palavras-chave)**: SQLite com **FTS5** e ranking BM25, utilizando tokenizador customizado com remoção de diacríticos para ignorar acentos.
-- **Motor Semântico (Compreensão de Contexto)**: Embeddings vetoriais locais baseados no modelo jurídico brasileiro `SamuelMauli/parity-embedding-juridico-br-v4` (~117M parâmetros).
-- **Busca Híbrida**: Algoritmo **RRF (Reciprocal Rank Fusion)** para fundir os resultados lexicais e semânticos.
-- **API Backend**: Construída com **FastAPI**, servindo endpoints REST documentados via Swagger.
-- **Frontend**: Interface web dinâmica (`index.html`) conectada diretamente à API.
+- **Busca Híbrida Inteligente**: Encontra acórdãos não apenas por palavras exatas, mas pelo significado e contexto jurídico (Busca Vetorial).
+- **Sumarização com IA (Generativa)**: Geração de resumos sólidos e fluidos em parágrafos contínuos com 1 clique (consumindo a API OpenAI).
+- **Extração Semântica Dinâmica**: O sistema varre o teor dos acórdãos localmente e sugere automaticamente os grandes temas em alta (ex: Licitação, Obras).
+- **Filtros Avançados**: Filtre por ano, colegiado, tipo de processo e relator com amarração total no banco de dados.
+- **100% Offline (Core)**: A busca vetorial e lexical rodam integralmente sem internet usando o banco SQLite local, poupando custos de cloud.
+- **Performance**: Paginação infinita assíncrona para lidar fluidamente com bases gigantes.
 
-## 📂 Estrutura do Projeto
+## 🏗️ Arquitetura do Projeto
 
-```text
-acordaos/
-├── data/
-│   └── acordao-completo-2026.md    # Base bruta de dados do TCU (4.566 acórdãos)
-├── db/
-│   └── acordaos.db                 # Banco de dados SQLite gerado
-├── src/
-│   ├── chunker.py                  # Parser e extrator de entidades do Markdown
-│   ├── indexer.py                  # Gestão do banco de dados e FTS5
-│   ├── embedder.py                 # Integração com o SentenceTransformers
-│   └── searcher.py                 # Lógica da busca Híbrida/Lexical/Semântica
-├── main.py                         # CLI para indexação e testes rápidos
-├── server.py                       # Servidor web FastAPI
-├── requirements.txt                # Dependências Python
-└── index.html                      # Interface do usuário (Frontend)
+O sistema foi modularizado seguindo as melhores práticas do ecossistema FastAPI e Vanilla JS:
+
+```
+tcu-busca-ia/
+├── data/                  # Base de acórdãos brutos (.md) e banco SQLite (ignorado no git)
+├── src/                   # Módulos Python (Searcher, Indexer, Embedder)
+├── static/                # Arquivos estáticos do Frontend
+│   ├── css/style.css      # Estilos customizados
+│   └── js/app.js          # Lógica assíncrona de renderização
+├── index.html             # Esqueleto principal da Interface
+├── main.py                # Ponto de entrada do FastAPI (Servidor Web)
+├── cli.py                 # Ferramenta de linha de comando (Indexação offline)
+├── requirements.txt       # Dependências do Python
+└── .env.example           # Exemplo das variáveis de ambiente
 ```
 
-## 🛠️ Como Usar
+## 🛠️ Tecnologias Utilizadas
 
-### 1. Instalar Dependências
+### Backend
+- **Python 3.10+**
+- **FastAPI & Uvicorn**: Servidor assíncrono super veloz.
+- **SQLite (FTS5)**: Banco de dados relacional e motor de busca em texto completo.
+- **Sentence-Transformers**: Geração de embeddings jurídicos locais (`SamuelMauli/parity-embedding-juridico-br-v4`).
+- **OpenAI SDK**: Para consumir LLMs generativas para sumarização.
 
-Certifique-se de usar Python 3.9+ e execute:
+### Frontend
+- **HTML5 / Vanilla JS**: Aplicação Single Page Application (SPA) levíssima.
+- **CSS3 Puro**: Design responsivo, moderno e totalmente isolado na pasta `static/css`.
 
+## ⚙️ Como Executar o Projeto Localmente
+
+### 1. Clonar o Repositório
 ```bash
+git clone https://github.com/SEU_USUARIO/tcu-busca-ia.git
+cd tcu-busca-ia
+```
+
+### 2. Criar o Ambiente Virtual e Instalar Dependências
+```bash
+python -m venv venv
+# No Windows:
+venv\Scripts\activate
+# No Linux/Mac:
+source venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-### 2. Indexar a Base de Dados
-
-Antes da primeira busca, é necessário extrair o arquivo Markdown, criar o banco e gerar os embeddings vetoriais (processo executado apenas uma vez e que pode demorar alguns minutos dependendo do hardware):
-
-```bash
-python main.py --indexar
+### 3. Configurar a Chave de IA
+Renomeie o arquivo `.env.example` para `.env` e insira a sua chave de API (OpenAI/TokenRouter) para habilitar o recurso de "Resumir com IA". O arquivo `.env` já está no `.gitignore` para a sua segurança.
+```env
+OPENAI_API_KEY=sk-sua_chave_aqui
 ```
 
-### 3. Rodar a Aplicação
-
-Inicie o servidor local FastAPI:
-
+### 4. Popular o Banco (Opcional)
+Se precisar forçar a re-indexação ou popular os embeddings via terminal antes de ligar a web:
 ```bash
-python server.py
+python cli.py --indexar
 ```
 
-Acesse no navegador:
-- **Interface Web:** [http://localhost:5000](http://localhost:5000)
-- **Documentação da API (Swagger):** [http://localhost:5000/docs](http://localhost:5000/docs)
-
-### 4. Usar a Interface de Linha de Comando (Opcional)
-
-Você pode realizar buscas rápidas sem iniciar o servidor:
-
+### 5. Iniciar o Servidor Web
 ```bash
-python main.py --buscar "fraude previdenciária" --modo hibrida -k 5
-python main.py --buscar "licitação" --modo lexical
+python main.py
 ```
+Acesse no navegador: [http://localhost:5000](http://localhost:5000)
 
-## 📊 Endpoints da API
-
-- `GET /` — Interface Web
-- `POST /api/buscar` — Executa uma busca (Lexical, Semântica ou Híbrida).
-- `GET /api/acordao/{chave}` — Retorna o detalhamento completo de uma decisão.
-- `GET /api/filtros` — Retorna os filtros disponíveis (anos, relatores, etc).
-- `GET /api/stats` — Retorna estatísticas de indexação.
+---
+*Desenvolvido com 💡 para inovar a pesquisa jurídica.*
