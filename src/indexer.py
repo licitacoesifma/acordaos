@@ -29,6 +29,10 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # Evita erros transitorios "database is locked" quando uma conexao de
+    # leitura coincide com o commit da conexao de escrita (sincronizacao
+    # em background), em vez de falhar a requisicao imediatamente.
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 

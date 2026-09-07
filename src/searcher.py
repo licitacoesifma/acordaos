@@ -102,6 +102,7 @@ def busca_lexical(
     colegiado: str = "",
     relator: str = "",
     tipo_processo: str = "",
+    incluir_trecho: bool = True,
 ) -> list[dict]:
     """Busca lexical usando FTS5 com ranking BM25.
 
@@ -109,11 +110,16 @@ def busca_lexical(
         conn: Conexao SQLite ativa.
         query: Texto da busca.
         top_k: Numero maximo de resultados.
+        incluir_trecho: Se False, nao busca/computa a coluna 'conteudo' nem o
+            trecho de destaque. Usado pela busca hibrida, que descarta a
+            maioria dos candidatos intermediarios apos a fusao RRF — buscar
+            e processar o texto completo deles seria desperdicio.
 
     Returns:
         Lista de dicionarios com os resultados, incluindo score BM25.
     """
-    sql = """
+    conteudo_select = "a.conteudo,\n            " if incluir_trecho else ""
+    sql = f"""
         SELECT
             a.id,
             a.chave,
@@ -127,8 +133,7 @@ def busca_lexical(
             a.entidade,
             a.assunto,
             a.sumario,
-            a.conteudo,
-            fts.rank AS score
+            {conteudo_select}fts.rank AS score
         FROM acordaos_fts fts
         JOIN acordaos a ON a.id = fts.rowid
         WHERE acordaos_fts MATCH ?
@@ -176,8 +181,9 @@ def busca_lexical(
         resultado = dict(row)
         # BM25 retorna valores negativos (mais negativo = mais relevante)
         resultado["score"] = -resultado["score"]
-        resultado["trecho"] = _extrair_trecho(resultado["conteudo"], query)
-        resultado.pop("conteudo", None)
+        if incluir_trecho:
+            resultado["trecho"] = _extrair_trecho(resultado["conteudo"], query)
+            resultado.pop("conteudo", None)
         resultados.append(resultado)
 
     return resultados
@@ -193,6 +199,7 @@ def busca_semantica(
     colegiado: str = "",
     relator: str = "",
     tipo_processo: str = "",
+    incluir_trecho: bool = True,
 ) -> list[dict]:
     """Busca semantica usando similaridade de cosseno com embeddings.
 
@@ -201,6 +208,8 @@ def busca_semantica(
         query: Texto da busca.
         model: Instancia do SentenceTransformer.
         top_k: Numero maximo de resultados.
+        incluir_trecho: Se False, nao busca a coluna 'conteudo' nem computa o
+            trecho de destaque (ver busca_lexical).
 
     Returns:
         Lista de dicionarios com os resultados, incluindo score de similaridade.
@@ -268,10 +277,11 @@ def busca_semantica(
     # Busca os metadados apenas dos selecionados (1 query, preservando a ordem)
     id_lista = [sid for sid, _ in selecionados]
     placeholders = ",".join("?" for _ in id_lista)
+    conteudo_col = ", conteudo" if incluir_trecho else ""
     linhas = conn.execute(
         f"""
         SELECT id, chave, titulo, tipo, numero_acordao, ano, colegiado,
-               relator, tipo_processo, entidade, assunto, sumario, conteudo
+               relator, tipo_processo, entidade, assunto, sumario{conteudo_col}
         FROM acordaos WHERE id IN ({placeholders})
         """,
         id_lista,
@@ -284,8 +294,9 @@ def busca_semantica(
         if dados is None:
             continue
         dados["score"] = score
-        dados["trecho"] = _extrair_trecho(dados.get("conteudo", ""), query)
-        dados.pop("conteudo", None)
+        if incluir_trecho:
+            dados["trecho"] = _extrair_trecho(dados.get("conteudo", ""), query)
+            dados.pop("conteudo", None)
         resultados.append(dados)
 
     return resultados
@@ -324,15 +335,20 @@ def busca_hibrida(
         return []
 
     # Busca mais resultados intermediarios para ter uma boa cobertura na fusao.
-    # Minimo de 50 garante fusao util mesmo para top_k pequeno.
+    # Minimo de 50 garante fusao util mesmo para top_k pequeno. incluir_trecho=False
+    # evita buscar/processar o texto completo (conteudo + extracao de trecho) para
+    # esses candidatos intermediarios: a maioria e descartada apos a fusao RRF, entao
+    # calcular o trecho deles seria trabalho jogado fora.
     search_scope = max(50, (offset + top_k) * 3)
     resultados_lex = busca_lexical(
         conn, query, top_k=search_scope, offset=0,
-        ano=ano, colegiado=colegiado, relator=relator, tipo_processo=tipo_processo
+        ano=ano, colegiado=colegiado, relator=relator, tipo_processo=tipo_processo,
+        incluir_trecho=False,
     )
     resultados_sem = busca_semantica(
         conn, query, model, top_k=search_scope, offset=0,
-        ano=ano, colegiado=colegiado, relator=relator, tipo_processo=tipo_processo
+        ano=ano, colegiado=colegiado, relator=relator, tipo_processo=tipo_processo,
+        incluir_trecho=False,
     )
 
     # Mapa chave -> dados do acordao (para metadados)
@@ -359,12 +375,27 @@ def busca_hibrida(
 
     # Ordena pelo score RRF combinado
     ranking = sorted(scores_rrf.items(), key=lambda x: x[1], reverse=True)
+    pagina = ranking[offset:offset + top_k]
+
+    # So agora, com o conjunto final ja definido (top_k, nao search_scope*2),
+    # busca o conteudo e computa o trecho de destaque para quem realmente vai
+    # ser retornado.
+    chaves_finais = [chave for chave, _ in pagina]
+    conteudo_por_chave: dict[str, str] = {}
+    if chaves_finais:
+        placeholders = ",".join("?" for _ in chaves_finais)
+        linhas = conn.execute(
+            f"SELECT chave, conteudo FROM acordaos WHERE chave IN ({placeholders})",
+            chaves_finais,
+        ).fetchall()
+        conteudo_por_chave = {row["chave"]: row["conteudo"] for row in linhas}
 
     resultados = []
-    for chave, score in ranking[offset:offset + top_k]:
+    for chave, score in pagina:
         dados = dados_acordaos[chave].copy()
         dados["score"] = round(score, 6)
         dados["metodo"] = "hibrido"
+        dados["trecho"] = _extrair_trecho(conteudo_por_chave.get(chave, ""), query)
         resultados.append(dados)
 
     return resultados

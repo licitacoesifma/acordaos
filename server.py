@@ -14,7 +14,7 @@ from openai import OpenAI
 # ──────────────────────────────────────────────
 # Configuração
 # ──────────────────────────────────────────────
-API_KEY = os.environ.get("TOKENROUTER_API_KEY", "sk-s82a7BxTCZSq9SWZZwnBZnESPTOfNgvSJsLNZCtAXLt4jzdq")
+API_KEY = os.environ.get("TOKENROUTER_API_KEY", "")
 BASE_URL = "https://api.tokenrouter.com/v1"
 MODEL = "z-ai/glm-5.3-free"
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
